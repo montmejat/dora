@@ -1921,6 +1921,94 @@ struct DataflowMetricsSnapshot {
     net_publish_failures: Arc<AtomicU64>,
 }
 
+/// What the metrics collector asks sysinfo to refresh.
+///
+/// `without_tasks` is load-bearing rather than an optimization: sysinfo lists
+/// threads as processes of their own whose `parent()` is the main pid, and a
+/// thread reports the whole process's RSS. Left enabled, the descendant walk in
+/// [`collect_and_send_metrics_bg`] sums a node's memory once per thread and
+/// reports it multiplied by the node's thread count.
+fn metrics_refresh_kind() -> sysinfo::ProcessRefreshKind {
+    sysinfo::ProcessRefreshKind::nothing()
+        .with_cpu()
+        .with_memory()
+        .with_disk_usage()
+        .without_tasks()
+}
+
+#[cfg(test)]
+mod metrics_refresh_tests {
+    use super::metrics_refresh_kind;
+    #[cfg(target_os = "linux")]
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    /// Pins the flag itself: `ProcessRefreshKind::nothing()` enables `tasks`
+    /// by default, so dropping the explicit `without_tasks()` silently
+    /// reintroduces the thread-count multiplication.
+    #[test]
+    fn metrics_refresh_excludes_tasks() {
+        assert!(
+            !metrics_refresh_kind().tasks(),
+            "metrics must not refresh per-thread task entries"
+        );
+    }
+
+    /// Pins the observable consequence, so a change in sysinfo's own defaults
+    /// is caught too: a refresh must not surface this process's threads as
+    /// processes parented to it, which is what made a node's memory report as
+    /// `rss * thread_count`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_does_not_list_own_threads_as_processes() {
+        let own_pid = std::process::id();
+        // Ensure the process really is multi-threaded while the refresh runs.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+
+        let thread_ids: Vec<u32> = std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|tid| *tid != own_pid)
+            .collect();
+        assert!(
+            !thread_ids.is_empty(),
+            "test process should have spawned threads"
+        );
+
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            metrics_refresh_kind(),
+        );
+        let listed: Vec<u32> = thread_ids
+            .iter()
+            .copied()
+            .filter(|tid| system.process(sysinfo::Pid::from_u32(*tid)).is_some())
+            .collect();
+
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            let _ = worker.join();
+        }
+
+        assert!(
+            listed.is_empty(),
+            "threads must not be listed as processes, else per-node memory is \
+             multiplied by the thread count: {listed:?}"
+        );
+    }
+}
+
 /// Collect and send metrics in the background. Errors are returned to the
 /// caller (the spawned task logs them).
 async fn collect_and_send_metrics_bg(
@@ -1931,7 +2019,7 @@ async fn collect_and_send_metrics_bg(
     clock: Arc<uhlc::HLC>,
 ) -> eyre::Result<()> {
     use dora_message::daemon_to_coordinator::NodeMetrics;
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+    use sysinfo::{Pid, ProcessesToUpdate};
 
     let has_any_running = dataflows
         .iter()
@@ -1947,10 +2035,7 @@ async fn collect_and_send_metrics_bg(
                 return Ok(());
             }
         };
-        let refresh_kind = ProcessRefreshKind::nothing()
-            .with_cpu()
-            .with_memory()
-            .with_disk_usage();
+        let refresh_kind = metrics_refresh_kind();
         let sys = tokio::task::spawn_blocking(move || {
             let mut sys = sys;
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
